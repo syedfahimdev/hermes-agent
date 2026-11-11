@@ -122,16 +122,21 @@ def resolve_store_python(repo_root: Path, *, publication: bool = False) -> Path 
     wins over an inherited ``HERMES_RUNTIME_DIR``. The override names a store
     for the running process (an e2e fixture, a desktop toolchain) that a later
     scratch cleanup may delete, leaving the launcher to exit 127 forever
-    (#131745). It still supplies the store when the tree records none.
+    (#131745). It still supplies the store when the tree records none. The
+    store directory is symlink-resolved too: a temp HERMES_HOME whose ``tools``
+    links to the real store must not bake its own deletable path.
     """
     if publication:
-        own = _store_python(store_root(repo_root, honor_runtime_override=False))
+        own = _store_python(
+            store_root(repo_root, honor_runtime_override=False), resolve_root=True)
         if own is not None:
             return own
-    return _store_python(store_root(repo_root))
+    return _store_python(store_root(repo_root), resolve_root=publication)
 
 
-def _store_python(runtime: Path) -> Path | None:
+def _store_python(runtime: Path, *, resolve_root: bool = False) -> Path | None:
+    if resolve_root:
+        runtime = Path(os.path.realpath(runtime))
     rel = "python.exe" if _is_windows() else "bin/python3"
 
     facts = runtime / "facts.json"
