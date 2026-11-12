@@ -53,10 +53,17 @@ KANBAN_SHOW_SCHEMA = _schema(
         "pre-formatted ``worker_context`` string suitable for inclusion "
         "verbatim in your reasoning. Outside a dispatcher-spawned worker "
         "there is no default task: a bare call returns a pointer to "
-        "``kanban_list`` instead of task state."
+        "``kanban_list`` instead of task state. By default (view=slim) body, comments and "
+        "closed-run text that ``worker_context`` already carries are not repeated, and noisy "
+        "events (heartbeat etc.) are dropped; pass view=full for the complete payload."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "view": _prop("string", (
+            "slim (default): body, comments and closed-run text that worker_context already "
+            "carries are not repeated; noisy events (heartbeat etc.) dropped, last 20 kept. "
+            "full: the complete old payload."
+        )),
     },
     [],
 )
