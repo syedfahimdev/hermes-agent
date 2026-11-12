@@ -657,11 +657,71 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
 
 
+# --- kanban_show slim view: drop what ``worker_context`` (kb.build_worker_context) already carries ---
+
+# Mirrors the caps in hermes_cli.kanban_db_context (_CTX_MAX_*).
+_SLIM_CTX_COMMENTS, _SLIM_CTX_ATTEMPTS = 30, 10
+_SLIM_CTX_BODY, _SLIM_CTX_COMMENT, _SLIM_CTX_FIELD = 8192, 2048, 4096
+_SLIM_OLD_RUN_CAP = 300
+_SLIM_EVENTS_KEPT = 20
+_SLIM_NOISE_EVENTS = frozenset({
+    "heartbeat", "owner_admitted", "worker_bound", "spawned", "workspace_cleanup_deferred_shared"})
+_SLIM_BODY_POINTER = "(in worker_context: ## Body)"
+
+
+def _json_len(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def _slim_run(run: dict, in_context: bool) -> dict:
+    """Closed run among the newest ones: text is in worker_context when every value fits its cap.
+    Older closed runs: summary/error/metadata truncated to a short preview."""
+    text = {k: run[k] for k in ("summary", "error", "metadata")}
+    if in_context:
+        fits = all(
+            v is None or (_json_len(v) if k == "metadata" else len(v)) <= _SLIM_CTX_FIELD
+            for k, v in text.items())
+        return {**run, **dict.fromkeys(text), "in_worker_context": True} if fits else run
+    out = dict(run)
+    for k, v in text.items():
+        size = 0 if v is None else _json_len(v) if k == "metadata" else len(v)
+        if size > _SLIM_OLD_RUN_CAP:
+            marker = f"… [slim: {size - _SLIM_OLD_RUN_CAP} chars omitted, kanban_show view=full]"
+            out[k] = marker if k == "metadata" else v[:_SLIM_OLD_RUN_CAP] + marker
+    return out
+
+
+def _slim_show(payload: dict, all_events: list) -> dict:
+    """Slim view of the full kanban_show payload (``all_events``: unsliced event dicts)."""
+    task = payload["task"]
+    if (task["body"] or "").strip() and len(task["body"].strip()) <= _SLIM_CTX_BODY:
+        task = {**task, "body": _SLIM_BODY_POINTER}
+    comments = payload["comments"]
+    first_in_ctx = max(len(comments) - _SLIM_CTX_COMMENTS, 0)
+    kept_comments = [
+        c for i, c in enumerate(comments)
+        if i < first_in_ctx or len((c["body"] or "").strip()) > _SLIM_CTX_COMMENT]
+    runs = payload["runs"]
+    closed = [i for i, r in enumerate(runs) if r["ended_at"] is not None]
+    recent = set(closed[-_SLIM_CTX_ATTEMPTS:])
+    slim_runs = [_slim_run(r, i in recent) if r["ended_at"] is not None else r
+                 for i, r in enumerate(runs)]
+    events = [e for e in all_events if e["kind"] not in _SLIM_NOISE_EVENTS][-_SLIM_EVENTS_KEPT:]
+    return {
+        **payload, "task": task, "comments": kept_comments,
+        "comments_in_worker_context": len(comments) - len(kept_comments),
+        "events": events, "events_omitted": len(all_events) - len(events),
+        "runs": slim_runs, "view": "slim"}
+
+
 # --- Handlers ---
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Task state: row, parents, children, comments, runs, events, worker_context.
+    ``view=slim`` (default) omits what worker_context repeats; ``view=full`` is the complete payload."""
+    view = args.get("view") or "slim"
+    _check(view in ("slim", "full"), "view must be 'slim' or 'full'")
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
@@ -676,7 +736,8 @@ def _handle_show(args: dict, **kw) -> str:
         })
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        all_events = [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)]
+        payload = {
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -686,10 +747,11 @@ def _handle_show(args: dict, **kw) -> str:
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
             # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
+            "events": all_events[-50:],
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "worker_context": kb.build_worker_context(conn, tid)}
+        return json.dumps(payload if view == "full" else _slim_show(payload, all_events))
 
 
 @_kanban_handler("kanban_list")
